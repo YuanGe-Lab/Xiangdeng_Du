@@ -1,0 +1,282 @@
+###
+#####data input
+###input feature table of bacterial community(rarefied_asv.csv), named as "asv"
+###input the biomass data, names as "biomass"
+###input the phylogenetic tree, named as "fasttree_rooted"
+###input the group data, named as "group"
+
+
+###calculate α diversity. For the asv here, row is asv, and column is sample
+alpha_index <- function(otu, method = NULL, tree = NULL, base = exp(1),include.root = TRUE) {
+  x = as.matrix(t(otu))
+  d1 = as.data.frame(t(estimateR(x)))
+  div = data.frame(richness=d1$S.obs,chao1=d1$S.chao1,ace=d1$S.ACE)
+  if(!is.null(colnames(otu))){rownames(div)=colnames(otu)}
+  div$shannon = vegan::diversity(x, index = 'shannon', base = base)
+  div$simpson = vegan::diversity(x, index = 'simpson')
+  div$pielou = div$shannon / log(div$richness, base)
+  if (!is.null(tree)&&!is.rooted(tree)) {
+    div$pd <- pd(x, tree, include.root = FALSE)[ ,1]
+    warning("the tree is not rooted")
+  }else if(!is.null(tree)&&is.rooted(tree)){
+    div$pd <- picante::pd(samp = x, tree = tree, include.root = include.root)[ ,1]
+  }
+  if(is.null(method)){
+    return(div)
+  }else{
+    return(div[,method[method%in%c('richness','chao1','ace','shannon','simpson','pielou',"pd")]])
+  }
+}
+
+alpha <- alpha_index(t(asv))
+
+###prune the phylogenetic tree
+tree <- prune.sample(asv,fasttree_rooted)
+
+###obtain the phylogenetic distance from tree
+dis <- cophenetic(tree)
+
+#####Null model analysis (community assembly process)
+###calculate betaNTI and RCbray, based on the "qpen" function in iCAMP package.
+library(iCAMP)
+
+qp <- qpen(comm = asv,pd = dis,nworker=8)
+
+###extract results accroding to group imformation
+div1 <- rownames(subset(group, diversity=='div1'))
+qp_div1 <- subset(qp$result, sample1 %in% div1 & sample2 %in% div1)
+
+div2 <- rownames(subset(group, diversity=='div2'))
+qp_div2 <- subset(qp$result, sample1 %in% div2 & sample2 %in% div2)
+
+div4 <- rownames(subset(group, diversity=='div4'))
+qp_div4 <- subset(qp$result, sample1 %in% div4 & sample2 %in% div4)
+
+div8 <- rownames(subset(group, diversity=='div8'))
+qp_div8 <- subset(qp$result, sample1 %in% div8 & sample2 %in% div8)
+
+
+qp_bNTI <- rbind(qp_div1[,c(1,2,5:7)],qp_div2[,c(1,2,5:7)],
+				qp_div4[,c(1,2,5:7)],qp_div8[,c(1,2,5:7)])
+
+qp_bNTI$div <- c(rep(1,nrow(qp_div1)),rep(2,nrow(qp_div2)),
+              rep(4,nrow(qp_div4)),rep(8,nrow(qp_div8)))
+
+qp_bNTI[(nrow(qp_bNTI)-2):nrow(qp_bNTI),]
+
+###check the proportion of Homogeneous.Selection, then add to the final figure
+nrow(qp_div1[which(qp_div1$process == "Homogeneous.Selection"),])/nrow(qp_div1)
+nrow(qp_div2[which(qp_div2$process == "Homogeneous.Selection"),])/nrow(qp_div2)
+nrow(qp_div4[which(qp_div4$process == "Homogeneous.Selection"),])/nrow(qp_div4)
+nrow(qp_div8[which(qp_div8$process == "Homogeneous.Selection"),])/nrow(qp_div8)
+
+#####create a table for the next drawing 
+alphabiomass <- cbind(div = group$div, shannon = alpha$shannon, biomass[,(ncol(biomass)-3):ncol(biomass)])
+
+
+###calculate the relative abundance of each asv
+asv_relative <- apply(asv,1,function(x){x/sum(x)})
+
+###Network analysis
+library(gtools)
+require(Hmisc)
+require(igraph)
+
+###create sampling aggregates (div1:samp1, div2:samp2, div4:samp4), output a proporties table
+samp1 <- t(combn(1:8,6))
+samp2 <- permutations(3,6,1:3,repeats.allowed = T)
+samp4 <- permutations(3,6,1:3,repeats.allowed = T)
+for (i in 1:6) {
+  samp2[,i] <- 5 + 3 * i + samp2[,i]
+}
+for (i in 1:6) {
+  samp4[,i] <- 23 + 3 * i + samp4[,i]
+}
+
+colnames(asv_relative[,samp1[1,]])
+
+result <- NULL
+for (i in 1:nrow(samp1)) {
+  asv_div1 <- asv_relative[,samp1[i,]]
+  asv_div1 <- asv_div1[which(rowSums(asv_div1) >= 0.005), ] 
+  asv1 <- asv_div1
+  asv1[asv1>0] <- 1
+  asv_div1 <- asv_div1[which(rowSums(asv1) >= 3), ]
+  asv_div1_corr <- rcorr(t(asv_div1), type = 'pearson')
+  r <- asv_div1_corr$r
+  r[abs(r) < 0.8] <- 0
+  p <- asv_div1_corr$P
+  p[p>=0.05] <- -1
+  p[p<0.05 & p>=0] <- 1
+  p[p==-1] <- 0
+  z <- r * p
+  diag(z) <- 0
+  g <- graph.adjacency(z, weighted = TRUE, mode = 'undirected')
+  g <- simplify(g)
+  g <- delete.vertices(g, names(degree(g)[degree(g) == 0]))
+  E(g)$correlation <- E(g)$weight
+  E(g)$weight <- abs(E(g)$weight)
+  node_num <- vcount(g)   
+  edge_num <- ecount(g)    
+  average_degree <- mean(degree(g))  
+  clustering_coefficient <- transitivity(g)    
+  result <- rbind(result, c(node_num, edge_num, average_degree, clustering_coefficient))
+}
+
+result_div1 <- data.frame(result)
+rownames(result_div1) <- c(paste0('div1_',1:nrow(samp1)))
+colnames(result_div1) <- c('node_num', 'edge_num', 'average_degree', 'clustering_coefficient')  
+result_div1$diversity <- 1
+result_div1$combination <- 1:nrow(result_div1)
+
+###check the average_degree proporties of all networks in each plant species richness treatment, then manually 
+###picked a representive network of each richness treatment
+
+###add biomass data corresponding to each network
+invader <- NULL
+native <- NULL
+relative <- NULL
+
+for (i in 1:nrow(samp1)) {
+  invader <- c(invader,mean(biomass$invader[samp1[i,]]))
+  native <- c(native,mean(biomass$native[samp1[i,]]))
+  relative <- c(relative,mean(biomass$relative[samp1[i,]]))
+}
+
+result_div1$invader <- invader
+result_div1$native <- native
+result_div1$relative <- relative
+
+result_combine <- rbind(result_div1,result_div2,result_div4)
+
+
+
+#####Figures
+
+###the relationship between invader and plant species richness
+ggplot(biomass[4:50,], aes(x = div, y = center)) +
+  geom_smooth(method = "lm",formula = y~x,colour = "black") +
+  geom_jitter(shape = 21,colour = "black",fill = "#b2b2b2",width = 0.1,height = 0.01,size = 4) +
+  xlab("Plant species richness") + ylab("S. canadensis biomass") +
+  theme_base() + 
+  theme(axis.text = element_text(size =  7),axis.title = element_text(size = 7)) + 
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y ~ x),
+                  geom = 'text',label.x = 6,size = 3,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)
+
+ggsave("../AI/Rout_pdf/biomass_richness.pdf", width = 80,height = 70,units = "mm")
+
+###the relationship between bacterial α diversity and plant species richness (regression)
+ggplot(alphabiomass[4:50,], aes(x = div, y = shannon)) +
+  geom_smooth(method = "lm",formula = y~x,colour = "black") +
+  geom_jitter(shape = 21,colour = "black",fill = "#b2b2b2",width = 0.1,height = 0.01,size = 4) +
+  xlab("Plant species richness") + ylab("Shannon") +
+  theme_base() + 
+  theme(axis.text = element_text(size =  7),axis.title = element_text(size = 7)) + 
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y ~ x),
+                  geom = 'text',label.x = 5,label.y = 1.5,size = 3,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)
+
+ggsave("../AI/Rout_pdf/shannon_richness.pdf", width = 80,height = 70,units = "mm")
+
+####the relationship between network complexity and plant species richness (regression)
+library(ggbeeswarm)
+ggplot(data = result1_combine,aes(x = diversity, y = average_degree)) +
+  geom_quasirandom(aes(color = factor(diversity)),alpha = 0.5,width = 0.1,size = 2) +
+  geom_smooth(aes(x = diversity, y = average_degree),method = "lm",color = "black") +
+  xlab("Plant species richness") + ylab("Average degree") +
+  theme_base() +
+  theme(legend.position = "none",axis.text = element_text(size = 7),axis.title = element_text(size = 7)) +
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y~x),
+                  geom = 'text',label.x = 3,size = 3,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)  
+
+ggsave("../AI/Rout_pdf/complexity_richness.pdf", width = 80,height = 70,units = "mm")
+
+###Null model analysis (community assembly process)
+ggplot(data = qp_bNTI[4:nrow(qp_bNTI),],aes(x = div, y = bNTI,group = div)) +
+  geom_boxplot(fill = "grey",outlier.shape = NA) +
+  geom_jitter(width = 0.2, height = 0.1,size = 0.8) +
+  theme_base() +
+  theme(axis.title = element_text(size = 7),axis.text = element_text(size = 7)) +
+  ylim(-4,4) +
+  geom_hline(yintercept = c(1.96,-1.96),linetype = "dashed") +
+  xlab("Plant species richness") + ylab("Beta-NTI")
+
+ggsave("../AI/Rout_pdf/assembly_richness.pdf", width = 80,height = 70,units = "mm")
+
+###the relationship between invader biomass and network complexity (average_degree)
+p <- ggplot(result_combine,aes(x = average_degree, y = invader,color = as.factor(diversity))) +
+  geom_point(size = 0.8,alpha = 0.3) +
+  theme_classic() +
+  geom_smooth(method = "lm",size = 0.5,se = F) +
+  geom_smooth(mapping = aes(x = average_degree, y = invader), method = "lm",color = "black",size = 0.5) +
+  theme_base() +
+  xlim(2.7,10.5) + ylim(200,1250) +
+  xlab("Average degree") + ylab("S. canadensis biomass") +
+  theme(axis.text = element_text(size = 8),axis.title = element_text(size = 8),
+        legend.title = element_text(size=8),legend.position="top",legend.text = element_text(size = 8)) +
+  labs(color = "Plant richness")  +
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y~x),
+                  geom = 'text',size = 2.5,label.x = 9,label.y = c(250,300,350),
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE) 
+
+p <- p + geom_point(data = result_combine[1:28,],aes(x = average_degree, y = relative), size = 0.8,alpha = 0.3)
+
+
+###supporting materials
+
+###the proportions of Homogeneous Selection change with plant species richness
+ggplot(data = qp_bNTI[4:340,], aes(x = div, y = bNTI)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "black") +  
+  theme_base() +
+  theme(axis.title = element_text(size = 7),axis.text = element_text(size = 7)) +
+  ylim(-4,4) +
+  xlab("Plant species richness") + ylab("Beta-NTI") +
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y~x),
+                  geom = 'text',label.x = 6,size = 3,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)
+
+ggsave("../AI/Rout_pdf/assembly_regression.pdf", width = 80,height = 70,units = "mm")
+
+###invader biomass and bacterial α diversity
+ggplot(alphabiomass[4:50,], aes(x = shannon, y = weighted_center)) +
+  geom_point(shape = 21,colour = "black",fill = "#b2b2b2",size = 4) +
+  geom_smooth(method = "lm",color = "black") +
+  xlab("Shannon") + ylab("S. canadensis biomass") +
+  theme_base() +
+  theme(axis.title = element_text(size = 7),axis.text = element_text(size = 7)) +
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y~x),
+                  geom = 'text',label.x = 2,size = 2.5,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)
+
+ggsave("../AI/Rout_pdf/shannon_biomass.pdf", width = 80,height = 70,units = "mm")
+
+###invader biomass and bacterial α diversity (grouped by plant species richness) 
+ggplot(alphabiomass[4:50,], aes(x = shannon, y = weighted_center,color = as.factor(div))) +
+  geom_point(size = 4) +
+  geom_smooth(method = "lm",se = F) +
+  xlab("Shannon") + ylab("S. canadensis biomass") +
+  theme_base() +
+  theme(axis.title = element_text(size = 7),axis.text = element_text(size = 7),legend.position = "none") +
+  stat_fit_glance(method = 'lm',
+                  method.args = list(formula = y~x),
+                  geom = 'text',label.x = 1.6,label.y = c(seq(2000,2600,length.out =4)),size = 2.5,
+                  aes(label = sprintf('italic(R)^2~"="~%.3f~~italic(p)~"="~%.3g',
+                                      after_stat(r.squared), after_stat(p.value))),parse = TRUE)
+
+ggsave("../AI/Rout_pdf/shannon_biomass_color.pdf", width = 80,height = 70,units = "mm")
+
